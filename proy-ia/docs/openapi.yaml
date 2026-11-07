@@ -1,0 +1,551 @@
+openapi: 3.0.3
+info:
+  title: API de conciliación de operaciones
+  version: 1.0.0
+  description: >-
+    API informativa para registrar pagos y movimientos del core bancario y
+    consultar conciliaciones por referencia. No ejecuta pagos ni mueve fondos.
+servers:
+  - url: /v1
+    description: Ruta base de la API
+tags:
+  - name: Payments
+    description: Registro de pagos informados
+  - name: Core transactions
+    description: Registro de movimientos del core bancario
+  - name: Reconciliations
+    description: Consulta del estado de conciliación
+paths:
+  /payments:
+    post:
+      tags:
+        - Payments
+      summary: Registrar un pago
+      description: >-
+        Crea una conciliación PENDING. operationReference es la clave
+        idempotente: un pago posterior para la misma referencia devuelve el
+        registro canónico sin modificarlo, incluso si el contenido difiere.
+      operationId: registerPayment
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentRequest'
+            examples:
+              validPayment:
+                summary: Pago válido
+                value:
+                  operationReference: OP-2026-0001
+                  accountNumber: '001234567890'
+                  amount: 1250.50
+                  currency: PEN
+                  occurredAt: '2026-11-05T15:30:00-05:00'
+      responses:
+        '201':
+          description: Pago registrado; conciliación creada en estado PENDING.
+          headers:
+            Location:
+              description: Ruta para consultar la conciliación.
+              schema:
+                type: string
+            X-Request-ID:
+              $ref: '#/components/headers/ResponseRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reconciliation'
+              examples:
+                pending:
+                  summary: Conciliación pendiente
+                  value:
+                    id: 14b3f791-48b3-4f20-9fa1-f31dd6ef9eb6
+                    operationReference: OP-2026-0001
+                    accountNumber: '001234567890'
+                    paymentAmount: 1250.50
+                    currency: PEN
+                    status: PENDING
+                    createdAt: '2026-11-05T20:30:00Z'
+        '200':
+          description: La referencia ya existía; se devuelve su registro canónico sin mutarlo.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/ResponseRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reconciliation'
+              examples:
+                existing:
+                  summary: Registro existente
+                  value:
+                    id: 14b3f791-48b3-4f20-9fa1-f31dd6ef9eb6
+                    operationReference: OP-2026-0001
+                    accountNumber: '001234567890'
+                    paymentAmount: 1250.50
+                    currency: PEN
+                    status: PENDING
+                    createdAt: '2026-11-05T20:30:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /core-transactions:
+    post:
+      tags:
+        - Core transactions
+      summary: Registrar un movimiento del core
+      description: >-
+        Asocia el movimiento con un pago existente y resuelve la conciliación.
+        La diferencia es pago menos core. MATCHED aplica cuando la diferencia
+        está entre cero y la tolerancia inclusiva (1.00 PEN por defecto);
+        MISMATCHED aplica cuando es negativa o supera la tolerancia. Los
+        estados terminales son inmutables y las solicitudes posteriores
+        devuelven el resultado canónico.
+      operationId: registerCoreTransaction
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CoreTransactionRequest'
+            examples:
+              validTransaction:
+                summary: Movimiento válido
+                value:
+                  operationReference: OP-2026-0001
+                  amount: 1250.00
+                  currency: PEN
+                  occurredAt: '2026-11-05T15:31:00-05:00'
+      responses:
+        '200':
+          description: Movimiento conciliado o resultado canónico confirmado.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/ResponseRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reconciliation'
+              examples:
+                matched:
+                  summary: Conciliación resuelta
+                  value:
+                    id: 14b3f791-48b3-4f20-9fa1-f31dd6ef9eb6
+                    operationReference: OP-2026-0001
+                    accountNumber: '001234567890'
+                    paymentAmount: 1250.50
+                    coreAmount: 1250.00
+                    difference: 0.50
+                    currency: PEN
+                    status: MATCHED
+                    createdAt: '2026-11-05T20:30:00Z'
+                    resolvedAt: '2026-11-05T20:31:12Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: No existe un pago previo para la referencia.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/ResponseRequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                paymentNotFound:
+                  summary: Pago requerido no encontrado
+                  value:
+                    type: https://example.com/problems/payment-not-found
+                    title: Pago no encontrado
+                    status: 404
+                    detail: No existe un pago previo para la referencia de operación indicada.
+                    instance: /v1/core-transactions
+                    requestId: 77daac81-1b33-4534-8eb4-3034c20e2f5e
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /reconciliations/{operationReference}:
+    get:
+      tags:
+        - Reconciliations
+      summary: Consultar una conciliación
+      description: >-
+        Devuelve el estado canónico de una conciliación sin modificarla. Para
+        PENDING se omiten coreAmount, difference y resolvedAt.
+      operationId: getReconciliation
+      parameters:
+        - name: operationReference
+          in: path
+          required: true
+          description: Referencia única de operación; debe codificarse como segmento de URL.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+            pattern: '^[\s\S]{1,64}$'
+          example: OP-2026-0001
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Conciliación encontrada.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/ResponseRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Reconciliation'
+              examples:
+                resolved:
+                  summary: Conciliación resuelta
+                  value:
+                    id: 14b3f791-48b3-4f20-9fa1-f31dd6ef9eb6
+                    operationReference: OP-2026-0001
+                    accountNumber: '001234567890'
+                    paymentAmount: 1250.50
+                    coreAmount: 1250.00
+                    difference: 0.50
+                    currency: PEN
+                    status: MATCHED
+                    createdAt: '2026-11-05T20:30:00Z'
+                    resolvedAt: '2026-11-05T20:31:12Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: No existe una conciliación para la referencia.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/ResponseRequestId'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                reconciliationNotFound:
+                  summary: Conciliación no encontrada
+                  value:
+                    type: https://example.com/problems/reconciliation-not-found
+                    title: Conciliación no encontrada
+                    status: 404
+                    detail: No existe una conciliación para la referencia de operación indicada.
+                    instance: /v1/reconciliations/OP-2026-9999
+                    requestId: 83ffb15a-2dbb-46c7-b34d-5d821afbb4e1
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+components:
+  parameters:
+    RequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: >-
+        Identificador de trazabilidad. Si se omite, el servicio genera uno.
+        Se devuelve en la respuesta y en el campo requestId de errores.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+      example: 8d94c633-9025-4db4-b3bc-321c493f125f
+  headers:
+    ResponseRequestId:
+      description: Identificador recibido o generado para correlación.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+  responses:
+    BadRequest:
+      description: Solicitud inválida, JSON mal formado o propiedades desconocidas.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/ResponseRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            validationError:
+              summary: Error de validación
+              value:
+                type: https://example.com/problems/validation-error
+                title: Solicitud inválida
+                status: 400
+                detail: Uno o más campos no cumplen las validaciones.
+                instance: /v1/payments
+                requestId: 8d94c633-9025-4db4-b3bc-321c493f125f
+                errors:
+                  - field: amount
+                    message: Debe ser positivo y tener como máximo 17 dígitos enteros y 2 decimales.
+    UnsupportedMediaType:
+      description: El request debe usar Content-Type application/json.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/ResponseRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            unsupportedMediaType:
+              value:
+                type: https://example.com/problems/unsupported-media-type
+                title: Tipo de contenido no soportado
+                status: 415
+                detail: El tipo de contenido admitido es application/json.
+                instance: /v1/payments
+                requestId: 8d94c633-9025-4db4-b3bc-321c493f125f
+    InternalServerError:
+      description: Error inesperado; no expone detalles internos.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/ResponseRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            internalError:
+              value:
+                type: https://example.com/problems/internal-error
+                title: Error interno
+                status: 500
+                detail: No fue posible procesar la solicitud.
+                instance: /v1/reconciliations/OP-2026-0001
+                requestId: 8d94c633-9025-4db4-b3bc-321c493f125f
+  schemas:
+    PaymentRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - operationReference
+        - accountNumber
+        - amount
+        - currency
+        - occurredAt
+      properties:
+        operationReference:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[\s\S]{1,64}$'
+          description: Referencia única de conciliación; clave idempotente.
+          example: OP-2026-0001
+        accountNumber:
+          type: string
+          minLength: 1
+          maxLength: 34
+          description: Número de cuenta informado en el pago.
+          example: '001234567890'
+        amount:
+          $ref: '#/components/schemas/PositiveAmount'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        occurredAt:
+          $ref: '#/components/schemas/OccurredAt'
+    CoreTransactionRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - operationReference
+        - amount
+        - currency
+        - occurredAt
+      properties:
+        operationReference:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[\s\S]{1,64}$'
+          description: Referencia de una conciliación con pago existente.
+          example: OP-2026-0001
+        amount:
+          $ref: '#/components/schemas/PositiveAmount'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        occurredAt:
+          $ref: '#/components/schemas/OccurredAt'
+    Reconciliation:
+      oneOf:
+        - $ref: '#/components/schemas/PendingReconciliation'
+        - $ref: '#/components/schemas/ResolvedReconciliation'
+      discriminator:
+        propertyName: status
+        mapping:
+          PENDING: '#/components/schemas/PendingReconciliation'
+          MATCHED: '#/components/schemas/ResolvedReconciliation'
+          MISMATCHED: '#/components/schemas/ResolvedReconciliation'
+      description: >-
+        PENDING responses omit coreAmount, difference and resolvedAt.
+        Terminal responses require all three fields.
+    ReconciliationBase:
+      type: object
+      required:
+        - id
+        - operationReference
+        - accountNumber
+        - paymentAmount
+        - currency
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Identificador estable de la conciliación.
+          example: 14b3f791-48b3-4f20-9fa1-f31dd6ef9eb6
+        operationReference:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[\s\S]{1,64}$'
+          example: OP-2026-0001
+        accountNumber:
+          type: string
+          minLength: 1
+          maxLength: 34
+          example: '001234567890'
+        paymentAmount:
+          $ref: '#/components/schemas/PositiveAmount'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        createdAt:
+          type: string
+          format: date-time
+          description: Fecha y hora de creación, expresada en UTC.
+          example: '2026-11-05T20:30:00Z'
+    PendingReconciliation:
+      allOf:
+        - $ref: '#/components/schemas/ReconciliationBase'
+        - type: object
+          required:
+            - status
+          properties:
+            status:
+              type: string
+              enum:
+                - PENDING
+              description: Pago registrado; aún no existe movimiento conciliado.
+              example: PENDING
+    ResolvedReconciliation:
+      allOf:
+        - $ref: '#/components/schemas/ReconciliationBase'
+        - type: object
+          required:
+            - coreAmount
+            - difference
+            - status
+            - resolvedAt
+          properties:
+            coreAmount:
+              $ref: '#/components/schemas/PositiveAmount'
+            difference:
+              type: number
+              format: decimal
+              multipleOf: 0.01
+              minimum: -99999999999999999.99
+              maximum: 99999999999999999.99
+              description: Diferencia calculada como paymentAmount menos coreAmount.
+              example: 0.50
+            status:
+              type: string
+              enum:
+                - MATCHED
+                - MISMATCHED
+              description: Estado terminal e inmutable.
+              example: MATCHED
+            resolvedAt:
+              type: string
+              format: date-time
+              description: Fecha y hora en que se determinó el estado terminal.
+              example: '2026-11-05T20:31:12Z'
+    PositiveAmount:
+      type: number
+      format: decimal
+      minimum: 0.01
+      maximum: 99999999999999999.99
+      multipleOf: 0.01
+      description: Importe positivo PEN, con hasta 17 dígitos enteros y 2 decimales.
+      example: 1250.50
+    Currency:
+      type: string
+      enum:
+        - PEN
+      description: Única moneda admitida.
+      example: PEN
+    OccurredAt:
+      type: string
+      format: date-time
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$'
+      description: Fecha y hora ISO-8601/RFC 3339 con zona u offset horario.
+      example: '2026-11-05T15:30:00-05:00'
+    Problem:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - title
+        - status
+        - detail
+        - instance
+        - requestId
+      properties:
+        type:
+          type: string
+          format: uri
+          description: URI que identifica el tipo de problema.
+          example: https://example.com/problems/validation-error
+        title:
+          type: string
+          description: Resumen legible del problema.
+          example: Solicitud inválida
+        status:
+          type: integer
+          format: int32
+          minimum: 400
+          maximum: 599
+          description: Código HTTP correspondiente a la respuesta.
+          example: 400
+        detail:
+          type: string
+          description: Explicación segura y específica de esta ocurrencia.
+          example: Uno o más campos no cumplen las validaciones.
+        instance:
+          type: string
+          format: uri-reference
+          description: Ruta que produjo el problema.
+          example: /v1/payments
+        requestId:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Identificador de trazabilidad, correspondiente a X-Request-ID.
+          example: 8d94c633-9025-4db4-b3bc-321c493f125f
+        errors:
+          type: array
+          description: Detalles opcionales de validación por campo.
+          items:
+            $ref: '#/components/schemas/FieldError'
+    FieldError:
+      type: object
+      additionalProperties: false
+      required:
+        - field
+        - message
+      properties:
+        field:
+          type: string
+          minLength: 1
+          description: Nombre del campo con error.
+          example: amount
+        message:
+          type: string
+          minLength: 1
+          description: Descripción de validación que no debe exponer datos sensibles.
+          example: Debe ser positivo y tener como máximo 17 dígitos enteros y 2 decimales.
